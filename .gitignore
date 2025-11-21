@@ -1,0 +1,14 @@
+# python
+__pycache__/
+*.pyc
+
+# checkpoints / outputs / datasets
+checkpoints/
+rpg_outputs/
+*.jsonl
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.npy
+*.npz
