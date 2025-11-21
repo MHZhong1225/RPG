@@ -64,3 +64,52 @@ def rpg_collate_fn(batch):
         "templates": templates,
         "pathologies": pathologies,
     }
+
+
+class RPGDataset_multi(Dataset):
+    """
+    JSONL 每行示例：
+    {
+      "id": "...",
+      "split": "train" / "val" / "test",
+      "image_path": ["xxx/0.png", "xxx/1.png"],
+      "template": "...",
+      "pathology": "..."
+    }
+    """
+    def __init__(self, jsonl_path, split: str = "train",
+                 image_root: str = "../datasets/iu_xray/images"):
+        self.samples = []
+        self.image_root = image_root
+        self.split = split
+
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                item_split = item.get("split", "train")
+                if split is not None and item_split != split:
+                    continue
+                self.samples.append(item)
+
+        print(f"[RPGDataset_multi] Loaded {len(self.samples)} samples for split = {split}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+
+        images = []
+        for rel_path in item["image_path"]:
+            img = Image.open(os.path.join(self.image_root, rel_path)).convert("RGB")
+            images.append(img)
+
+        return {
+            "images": images,              # list[PIL]
+            "template": item["template"],
+            "pathology": item["pathology"],
+        }
+

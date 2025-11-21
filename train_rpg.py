@@ -1,80 +1,76 @@
 # train_rpg.py
+import argparse
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import json
-from PIL import Image
-
+import shutil
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.nn import functional as F
 from tqdm import tqdm
 
 from model_rpg import RPGModel
-from rpg_dataset import RPGDataset
+from rpg_dataset import RPGDataset, rpg_collate_fn
 
-# 1. Dataset & collate_fn
-class RPGDataset_multi(Dataset):
+
+# ---------------------------
+# helpers
+# ---------------------------
+def freeze_all_but_adapter(model: RPGModel, adapter_name: str, train_template_proj=True, train_cross_aligner=True):
     """
-    JSONL 每行示例：
-    {
-      "id": "...",
-      "split": "train" / "val" / "test",
-      "image_path": ["xxx/0.png", "xxx/1.png"],
-      "template": "...",
-      "pathology": "..."
-    }
+    你当前的 model_rpg.py 没有 freeze_all_but。
+    这里提供等价版本：
+      - 冻结全部参数
+      - 仅解冻指定 adapter 的 LoRA 参数
+      - 可选解冻 template_proj / cross_aligner
     """
-    def __init__(self, jsonl_path, split: str = "train",
-                 image_root: str = "../datasets/iu_xray/images"):
-        self.samples = []
-        self.image_root = image_root
-        self.split = split
+    # freeze all
+    for p in model.parameters():
+        p.requires_grad = False
 
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                item_split = item.get("split", "train")
-                if split is not None and item_split != split:
-                    continue
-                self.samples.append(item)
+    # unfreeze LoRA params belonging to the adapter
+    for n, p in model.lm.named_parameters():
+        # peft 的 LoRA 参数名里通常包含 "lora"
+        if "lora" in n and adapter_name in n:
+            p.requires_grad = True
 
-        print(f"[RPGDataset_multi] Loaded {len(self.samples)} samples for split = {split}")
+    # aux modules
+    if train_template_proj:
+        for p in model.template_proj.parameters():
+            p.requires_grad = True
 
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        item = self.samples[idx]
-
-        images = []
-        for rel_path in item["image_path"]:
-            img = Image.open(os.path.join(self.image_root, rel_path)).convert("RGB")
-            images.append(img)
-
-        return {
-            "images": images,              # list[PIL]
-            "template": item["template"],
-            "pathology": item["pathology"],
-        }
+    if train_cross_aligner:
+        for p in model.cross_aligner.parameters():
+            p.requires_grad = True
 
 
-def rpg_collate_fn(batch):
-    images = [b["images"] for b in batch]       # list[list[PIL]]
-    templates = [b["template"] for b in batch]
-    pathologies = [b["pathology"] for b in batch]
+def export_one_adapter(src_root: str, adapter_name: str, dst_dir: str):
+    """
+    PEFT 多 adapter 保存后常见结构：
+      src_root/<adapter_name>/adapter_config.json
 
-    return {
-        "images": images,
-        "templates": templates,
-        "pathologies": pathologies,
-    }
+    本函数会自动找到真正的 adapter 文件夹，然后只拷贝这一份到 dst_dir。
+    """
+    cand1 = src_root
+    cand2 = os.path.join(src_root, adapter_name)
+
+    if os.path.exists(os.path.join(cand1, "adapter_config.json")):
+        real_src = cand1
+    elif os.path.exists(os.path.join(cand2, "adapter_config.json")):
+        real_src = cand2
+    else:
+        raise ValueError(
+            f"[export_one_adapter] Can't find adapter_config.json in "
+            f"{cand1} or {cand2}"
+        )
+
+    shutil.rmtree(dst_dir, ignore_errors=True)
+    shutil.copytree(real_src, dst_dir)
 
 
+# ---------------------------
 # 2. train / eval
+# ---------------------------
 def train_template_epoch(model, dataloader, optimizer, device, max_length=128, loss_log=None):
     model.train()
     pbar = tqdm(dataloader)
@@ -94,7 +90,6 @@ def train_template_epoch(model, dataloader, optimizer, device, max_length=128, l
 
         if loss_log is not None:
             loss_log["template_train"].append(loss_t.item())
-
         pbar.set_description(f"[Template][train] Loss: {loss_t.item():.4f}")
 
 
@@ -126,10 +121,17 @@ def train_residual_epoch(
     device,
     max_length=128,
     lambda_causal=0.1,
+    lambda_lang_causal=0.1,
     cf_mode="patch_drop",
     drop_ratio=0.3,
     loss_log=None,
 ):
+    """
+    Residual 阶段训练（最终 RPG）：
+      factual
+      visual implicit CF  -> causal loss
+      language CF (h_t=0, drop_ratio=0) -> causal loss
+    """
     model.train()
     pbar = tqdm(dataloader)
     for batch in pbar:
@@ -137,7 +139,7 @@ def train_residual_epoch(
         templates = batch["templates"]
         pathologies = batch["pathologies"]
 
-        # factual
+        # ---------- factual ----------
         outputs_f, h_v, h_t, r_p = model.forward_residual(
             images=images,
             template_texts=templates,
@@ -149,8 +151,8 @@ def train_residual_epoch(
         )
         loss_f = outputs_f.loss
 
-        # implicit counterfactual
-        outputs_cf, r_p_cf = model.forward_residual_implicit_cf(
+        # ---------- visual implicit cf ----------
+        outputs_cf_v, r_p_cf_v = model.forward_residual_implicit_cf(
             h_v=h_v,
             h_t=h_t,
             pathology_texts=pathologies,
@@ -163,12 +165,36 @@ def train_residual_epoch(
         )
 
         h_f = outputs_f.hidden_states[-1]
-        h_cf = outputs_cf.hidden_states[-1]
-        loss_causal_hidden = F.mse_loss(h_f.float(), h_cf.float())
-        loss_causal_prefix = F.mse_loss(r_p.float(), r_p_cf.float())
-        loss_causal = 0.5 * loss_causal_hidden + 0.5 * loss_causal_prefix
+        h_cf_v = outputs_cf_v.hidden_states[-1]
+        loss_causal_hidden_v = F.mse_loss(h_f.float(), h_cf_v.float())
+        loss_causal_prefix_v = F.mse_loss(r_p.float(), r_p_cf_v.float())
+        loss_causal_v = 0.5 * loss_causal_hidden_v + 0.5 * loss_causal_prefix_v
 
-        loss = loss_f + lambda_causal * loss_causal
+        # ---------- language cf (remove template prior) ----------
+        # 通过 h_t_zero + drop_ratio=0 复用 implicit_cf forward
+        if lambda_lang_causal > 0:
+            h_t_zero = torch.zeros_like(h_t)
+            outputs_cf_l, r_p_cf_l = model.forward_residual_implicit_cf(
+                h_v=h_v,
+                h_t=h_t_zero,
+                pathology_texts=pathologies,
+                max_length=max_length,
+                use_labels=False,
+                return_hidden=True,
+                cf_mode=cf_mode,
+                drop_ratio=0.0,   # ensure visual not changed
+                return_prefix=True,
+            )
+
+            h_cf_l = outputs_cf_l.hidden_states[-1]
+            loss_causal_hidden_l = F.mse_loss(h_f.float(), h_cf_l.float())
+            loss_causal_prefix_l = F.mse_loss(r_p.float(), r_p_cf_l.float())
+            loss_causal_l = 0.5 * loss_causal_hidden_l + 0.5 * loss_causal_prefix_l
+        else:
+            loss_causal_l = torch.tensor(0.0, device=device)
+
+        # total
+        loss = loss_f + lambda_causal * loss_causal_v + lambda_lang_causal * loss_causal_l
 
         optimizer.zero_grad()
         loss.backward()
@@ -178,10 +204,12 @@ def train_residual_epoch(
         if loss_log is not None:
             loss_log["residual_train_total"].append(loss.item())
             loss_log["residual_train_f"].append(loss_f.item())
-            loss_log["residual_train_causal"].append(loss_causal.item())
+            loss_log["residual_train_causal_vis"].append(loss_causal_v.item())
+            loss_log["residual_train_causal_lang"].append(loss_causal_l.item())
 
         pbar.set_description(
-            f"[Residual][train] Loss: {loss.item():.4f} (f={loss_f.item():.4f}, c={loss_causal.item():.4f})"
+            f"[Residual][train] Loss: {loss.item():.4f} "
+            f"(f={loss_f.item():.4f}, cv={loss_causal_v.item():.4f}, cl={loss_causal_l.item():.4f})"
         )
 
 
@@ -192,6 +220,7 @@ def eval_residual_epoch(
     device,
     max_length=128,
     lambda_causal=0.1,
+    lambda_lang_causal=0.1,
     cf_mode="patch_drop",
     drop_ratio=0.3,
     loss_log=None,
@@ -215,7 +244,7 @@ def eval_residual_epoch(
         )
         loss_f = outputs_f.loss
 
-        outputs_cf, r_p_cf = model.forward_residual_implicit_cf(
+        outputs_cf_v, r_p_cf_v = model.forward_residual_implicit_cf(
             h_v=h_v,
             h_t=h_t,
             pathology_texts=pathologies,
@@ -228,16 +257,37 @@ def eval_residual_epoch(
         )
 
         h_f = outputs_f.hidden_states[-1]
-        h_cf = outputs_cf.hidden_states[-1]
-        loss_causal_hidden = F.mse_loss(h_f.float(), h_cf.float())
-        loss_causal_prefix = F.mse_loss(r_p.float(), r_p_cf.float())
-        loss_causal = 0.5 * loss_causal_hidden + 0.5 * loss_causal_prefix
+        h_cf_v = outputs_cf_v.hidden_states[-1]
+        loss_causal_hidden_v = F.mse_loss(h_f.float(), h_cf_v.float())
+        loss_causal_prefix_v = F.mse_loss(r_p.float(), r_p_cf_v.float())
+        loss_causal_v = 0.5 * loss_causal_hidden_v + 0.5 * loss_causal_prefix_v
 
-        loss = loss_f + lambda_causal * loss_causal
+        if lambda_lang_causal > 0:
+            h_t_zero = torch.zeros_like(h_t)
+            outputs_cf_l, r_p_cf_l = model.forward_residual_implicit_cf(
+                h_v=h_v,
+                h_t=h_t_zero,
+                pathology_texts=pathologies,
+                max_length=max_length,
+                use_labels=False,
+                return_hidden=True,
+                cf_mode=cf_mode,
+                drop_ratio=0.0,
+                return_prefix=True,
+            )
+            h_cf_l = outputs_cf_l.hidden_states[-1]
+            loss_causal_hidden_l = F.mse_loss(h_f.float(), h_cf_l.float())
+            loss_causal_prefix_l = F.mse_loss(r_p.float(), r_p_cf_l.float())
+            loss_causal_l = 0.5 * loss_causal_hidden_l + 0.5 * loss_causal_prefix_l
+        else:
+            loss_causal_l = torch.tensor(0.0, device=device)
+
+        loss = loss_f + lambda_causal * loss_causal_v + lambda_lang_causal * loss_causal_l
         losses.append(loss.item())
 
         pbar.set_description(
-            f"[Residual][val] Loss: {loss.item():.4f} (f={loss_f.item():.4f}, c={loss_causal.item():.4f})"
+            f"[Residual][val] Loss: {loss.item():.4f} "
+            f"(f={loss_f.item():.4f}, cv={loss_causal_v.item():.4f}, cl={loss_causal_l.item():.4f})"
         )
 
     mean_loss = sum(losses) / max(1, len(losses))
@@ -246,27 +296,28 @@ def eval_residual_epoch(
     return mean_loss
 
 
-############################################
+# ---------------------------
 # 3. main
+# ---------------------------
+def main(args):
+    train_jsonl = args.train_jsonl
+    lm_name = args.lm_name
+    clip_name = args.clip_name
+    template_enc_name = args.template_enc_name
 
-def main():
-    train_jsonl = "./rpg_outputs/iu_xray/decomposed_reports.jsonl"
-    lm_name = "llava-hf/llava-v1.6-mistral-7b-hf"
-    clip_name = "openai/clip-vit-base-patch32"
-    template_enc_name = "pritamdeka/S-BioBert-snli-multinli-stsb"
+    batch_size = args.batch_size
+    num_workers = args.num_workers
+    max_length = args.max_length
 
-    batch_size = 4
-    num_workers = 4
-    max_length = 128
+    template_epochs = args.t_epochs
+    residual_epochs = args.r_epochs
+    lambda_causal = args.lambda_causal
+    lambda_lang_causal = args.lambda_lang_causal
+    cf_mode = args.cf_mode
+    drop_ratio = args.dropout
 
-    template_epochs = 10
-    residual_epochs = 10
-    lambda_causal = 0.1
-    cf_mode = "patch_drop"
-    drop_ratio = 0.3
-
-    lr = 1e-5
-    device = "cuda:1" if torch.cuda.is_available() else "cpu"
+    lr = args.lr
+    device = args.device if torch.cuda.is_available() else "cpu"
 
     # logs
     loss_log = {
@@ -274,7 +325,8 @@ def main():
         "template_val": [],
         "residual_train_total": [],
         "residual_train_f": [],
-        "residual_train_causal": [],
+        "residual_train_causal_vis": [],
+        "residual_train_causal_lang": [],
         "residual_val_total": [],
     }
 
@@ -283,16 +335,13 @@ def main():
         lm_name=lm_name,
         clip_model_name=clip_name,
         template_model_name=template_enc_name,
-        lora_r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         lora_ckpt=None,
         aux_ckpt=None,
     )
     model.to(device)
-
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
     # datasets / loaders
     train_dataset = RPGDataset(jsonl_path=train_jsonl, split="train")
@@ -304,6 +353,7 @@ def main():
         shuffle=True,
         num_workers=num_workers,
         collate_fn=rpg_collate_fn,
+        pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -311,17 +361,23 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         collate_fn=rpg_collate_fn,
+        pin_memory=True,
     )
 
     os.makedirs("./checkpoints", exist_ok=True)
 
     # ========= Stage 1 =========
     print("\n===== Stage 1: Train Template Path (LoRA_t) =====")
-    best_t_val = float("inf")
-    best_t_path = "./checkpoints/best_template.pt"
+    model.lm.set_adapter("template")
+    freeze_all_but_adapter(model, "template", train_template_proj=True, train_cross_aligner=True)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
 
-    for epoch in range(template_epochs):
-        print(f"Epoch {epoch+1}/{template_epochs}")
+    best_t_val = float("inf")
+    best_t_dir = "./checkpoints/best_template_lora"
+    best_t_aux = "./checkpoints/best_template_aux.pt"
+
+    for ep in range(template_epochs):
+        print(f"Epoch {ep+1}/{template_epochs}")
         train_template_epoch(
             model=model,
             dataloader=train_loader,
@@ -341,23 +397,35 @@ def main():
 
         if val_loss < best_t_val:
             best_t_val = val_loss
+
+            model.lm.save_pretrained(
+                best_t_dir,
+                save_adapter=True,
+                adapter_name="template",
+            )
+
             torch.save(
                 {
-                    "lm": model.lm.state_dict(),  # LoRA 权重在 lm 里
                     "cross_aligner": model.cross_aligner.state_dict(),
                     "template_proj": model.template_proj.state_dict(),
                 },
-                best_t_path
+                best_t_aux
             )
-            print(f"Saved best template checkpoint to {best_t_path}")
+            print(f"Saved best TEMPLATE LoRA to {best_t_dir}")
+            print(f"Saved best TEMPLATE aux to  {best_t_aux}")
 
     # ========= Stage 2 =========
-    print("\n===== Stage 2: Train Residual Path with Implicit Counterfactual (LoRA_p) =====")
-    best_p_val = float("inf")
-    best_p_path = "./checkpoints/best_residual.pt"
+    print("\n===== Stage 2: Train Residual Path (LoRA_p) =====")
+    model.lm.set_adapter("residual")
+    freeze_all_but_adapter(model, "residual", train_template_proj=True, train_cross_aligner=True)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
 
-    for epoch in range(residual_epochs):
-        print(f"Epoch {epoch+1}/{residual_epochs}")
+    best_p_val = float("inf")
+    best_p_dir = "./checkpoints/best_residual_lora"
+    best_p_aux = "./checkpoints/best_residual_aux.pt"
+
+    for ep in range(residual_epochs):
+        print(f"Epoch {ep+1}/{residual_epochs}")
         train_residual_epoch(
             model=model,
             dataloader=train_loader,
@@ -365,6 +433,7 @@ def main():
             device=device,
             max_length=max_length,
             lambda_causal=lambda_causal,
+            lambda_lang_causal=lambda_lang_causal,
             cf_mode=cf_mode,
             drop_ratio=drop_ratio,
             loss_log=loss_log,
@@ -375,6 +444,7 @@ def main():
             device=device,
             max_length=max_length,
             lambda_causal=lambda_causal,
+            lambda_lang_causal=lambda_lang_causal,
             cf_mode=cf_mode,
             drop_ratio=drop_ratio,
             loss_log=loss_log,
@@ -383,49 +453,76 @@ def main():
 
         if val_loss < best_p_val:
             best_p_val = val_loss
+
+            model.lm.save_pretrained(
+                best_p_dir,
+                save_adapter=True,
+                adapter_name="residual",
+            )
+
             torch.save(
                 {
-                    "lm": model.lm.state_dict(),
                     "cross_aligner": model.cross_aligner.state_dict(),
                     "template_proj": model.template_proj.state_dict(),
                 },
-                best_p_path
+                best_p_aux
             )
-            print(f"Saved best residual checkpoint to {best_p_path}")
+            print(f"Saved best RESIDUAL LoRA to {best_p_dir}")
+            print(f"Saved best RESIDUAL aux to  {best_p_aux}")
 
-    # ========= Load best residual then export =========
-    print("\nLoading best residual checkpoint before final export...")
-    ckpt = torch.load(best_p_path, map_location="cpu")
-    model.lm.load_state_dict(ckpt["lm"], strict=False)
-    model.cross_aligner.load_state_dict(ckpt["cross_aligner"])
-    model.template_proj.load_state_dict(ckpt["template_proj"])
-    model.to(device)
+    # ========= Export =========
+    print("\n===== Export BEST adapters (clean PEFT structure) =====")
+    os.makedirs("./rpg_llava_lora", exist_ok=True)
 
-    # ========= 保存权重 =========
-    print("\nSaving LoRA weights (best) ...")
-
-    model.lm.save_pretrained(
-        "./rpg_llava_lora/",
-        save_adapter=True,
+    export_one_adapter(
+        src_root=best_t_dir,
         adapter_name="template",
+        dst_dir="./rpg_llava_lora/template"
     )
-    model.lm.save_pretrained(
-        "./rpg_llava_lora/",
-        save_adapter=True,
+    export_one_adapter(
+        src_root=best_p_dir,
         adapter_name="residual",
+        dst_dir="./rpg_llava_lora/residual"
     )
 
-    torch.save(
-        {
-            "cross_aligner": model.cross_aligner.state_dict(),
-            "template_proj": model.template_proj.state_dict(),
-        },
-        "./rpg_llava_lora/rpg_aux.pt",
-    )
+    shutil.copy2(best_p_aux, "./rpg_llava_lora/rpg_aux.pt")
 
-    print("Saved BEST LoRA to ./rpg_llava_lora/")
-    print("Saved BEST aux to ./rpg_aux.pt")
+    print("BEST template adapter -> ./rpg_llava_lora/template")
+    print("BEST residual adapter -> ./rpg_llava_lora/residual")
+    print("BEST aux -> ./rpg_llava_lora/rpg_aux.pt")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+
+    # data / train
+    parser.add_argument("--train_jsonl", type=str, default="./rpg_outputs/iu_xray/decomposed_reports.jsonl")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--t_epochs", type=int, default=20)
+    parser.add_argument("--r_epochs", type=int, default=20)
+    parser.add_argument("--device", type=str, default="cuda:1")
+
+    # model ids
+    parser.add_argument("--lm_name", type=str, default="llava-hf/llava-v1.6-mistral-7b-hf")
+    parser.add_argument("--clip_name", type=str, default="openai/clip-vit-base-patch32")
+    parser.add_argument("--template_enc_name", type=str, default="pritamdeka/S-BioBert-snli-multinli-stsb")
+
+    # lora config
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+
+    # causal / RPG losses
+    parser.add_argument("--lambda_causal", type=float, default=0.1, help="visual implicit CF causal weight")
+    parser.add_argument("--lambda_lang_causal", type=float, default=0.1, help="language CF causal weight (set 0 to disable)")
+
+    # implicit visual CF settings
+    parser.add_argument("--cf_mode", type=str, default="patch_drop",
+                        choices=["patch_drop", "patch_shuffle"])
+    parser.add_argument("--dropout", type=float, default=0.3, help="drop_ratio for implicit visual CF")
+
+    args = parser.parse_args()
+    main(args)

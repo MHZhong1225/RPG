@@ -122,7 +122,8 @@ class CrossAttentionAligner(nn.Module):
             num_heads=n_heads,
             batch_first=True
         )
-
+        self.ln = nn.LayerNorm(d_hidden)
+        
     def forward(self, h_v, h_t):
         # h_v: [B, N_patches, d_v]
         # h_t: [B, d_t]
@@ -135,7 +136,7 @@ class CrossAttentionAligner(nn.Module):
             key=h_v_proj,
             value=h_v_proj
         )  # [B, 1, hidden]
-
+        h_cross = self.ln(h_cross)
         return h_cross
 
 
@@ -172,7 +173,7 @@ class RPGModel(nn.Module):
             low_cpu_mem_usage=True,
         )
 
-        processor = LlavaNextProcessor.from_pretrained(lm_name)
+        processor = LlavaNextProcessor.from_pretrained(lm_name,use_fast=True)
         self.tokenizer = processor.tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -192,7 +193,7 @@ class RPGModel(nn.Module):
             lora_dropout=lora_dropout,
             target_modules=target_modules,
             bias="none",
-            task_type="CAUSAL_LM",
+            # task_type="CAUSAL_LM",
         )
 
         residual_lora = LoraConfig(
@@ -201,7 +202,7 @@ class RPGModel(nn.Module):
             lora_dropout=lora_dropout,
             target_modules=target_modules,
             bias="none",
-            task_type="CAUSAL_LM",
+            # task_type="CAUSAL_LM",
         )
 
         # 3) 构建双 LoRA 
@@ -512,3 +513,354 @@ class RPGModel(nn.Module):
         if return_prefix:
             return outputs_cf, prefix_vec_cf
         return outputs_cf
+
+
+@torch.no_grad()
+def generate_with_prefix_causal(
+    model,
+    prefix_vec: torch.Tensor,
+    prefix_cf_vec: torch.Tensor,
+    adapter_name: str,
+    max_new_tokens: int = 128,
+    gamma: float = 1.0,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+):
+    """
+    反事实推理：
+      - factual:     prefix_vec
+      - counterfact: prefix_cf_vec （比如“去视觉”的前缀）
+    两条序列共享同样的 prompt & 已生成 token，只在 prefix 上做反事实。
+    """
+    lm = model.lm
+    tokenizer = model.tokenizer
+    device = prefix_vec.device
+
+    lm.set_adapter(adapter_name)
+
+    # ---------- 1. prefix embeddings ----------
+    prefix_embeds_f, prefix_mask_f = model._build_prefix(prefix_vec)    # [1,P,H], [1,P]
+    prefix_embeds_cf, prefix_mask_cf = model._build_prefix(prefix_cf_vec)  # [1,P,H], [1,P]
+
+    # ---------- 2. prompt embeddings ----------
+    if adapter_name == "template":
+        prompt_text = (
+            "Write a concise, structured radiology IMPRESSION for a chest X-ray. "
+            "Do not list findings. Summarize clinical significance only.\n"
+            "Impression: "
+        )
+    else:
+        prompt_text = (
+            "Write detailed radiology FINDINGS for a chest X-ray. "
+            "Focus on abnormalities. Do not write the impression.\n"
+            "Findings: "
+        )
+
+    prompt_ids = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+        add_special_tokens=False
+    ).input_ids.to(device)
+
+    input_emb_layer = lm.get_input_embeddings()
+    prompt_embeds = input_emb_layer(prompt_ids)  # [1, L, H]
+    prompt_mask = torch.ones((1, prompt_embeds.size(1)), dtype=torch.long, device=device)
+
+    # ---------- 3. BOS token ----------
+    bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
+    bos_ids = torch.tensor([[bos_id]], device=device)
+    bos_embeds = input_emb_layer(bos_ids)  # [1,1,H]
+    bos_mask = torch.ones((1, 1), dtype=torch.long, device=device)
+
+    # ---------- 4. 拼接 prefix + prompt + BOS ----------
+    inputs_embeds_f = torch.cat([prefix_embeds_f, prompt_embeds, bos_embeds], dim=1)
+    attention_mask_f = torch.cat([prefix_mask_f, prompt_mask, bos_mask], dim=1)
+
+    inputs_embeds_cf = torch.cat([prefix_embeds_cf, prompt_embeds, bos_embeds], dim=1)
+    attention_mask_cf = torch.cat([prefix_mask_cf, prompt_mask, bos_mask], dim=1)
+
+    # ---------- 5. 自回归生成（每步跑 factual + counterfactual） ----------
+    generated = []
+    for _ in range(max_new_tokens):
+        # factual 前向
+        out_f = lm(
+            inputs_embeds=inputs_embeds_f,
+            attention_mask=attention_mask_f,
+            use_cache=False,
+        )
+        logits_f = out_f.logits[:, -1, :]  # [1,V]
+
+        # counterfactual 前向
+        out_cf = lm(
+            inputs_embeds=inputs_embeds_cf,
+            attention_mask=attention_mask_cf,
+            use_cache=False,
+        )
+        logits_cf = out_cf.logits[:, -1, :]  # [1,V]
+
+        # 因果融合获取最终 prob
+        probs = causal_combine_logits(
+            logits_f=logits_f,
+            logits_cf=logits_cf,
+            gamma=gamma,
+            temperature=temperature,
+            top_p=top_p,
+            eps=1e-5,
+        )
+
+        # 采样
+        next_token = torch.multinomial(probs, num_samples=1)  # [1,1]
+        tok = next_token.item()
+        if tok == tokenizer.eos_token_id:
+            break
+
+        generated.append(tok)
+
+        # 两条路径都 append 同样的 token（共享语言上下文）
+        tok_embeds = input_emb_layer(next_token)  # [1,1,H]
+
+        inputs_embeds_f = torch.cat([inputs_embeds_f, tok_embeds], dim=1)
+        attention_mask_f = torch.cat(
+            [attention_mask_f, torch.ones((1, 1), dtype=torch.long, device=device)],
+            dim=1,
+        )
+
+        inputs_embeds_cf = torch.cat([inputs_embeds_cf, tok_embeds], dim=1)
+        attention_mask_cf = torch.cat(
+            [attention_mask_cf, torch.ones((1, 1), dtype=torch.long, device=device)],
+            dim=1,
+        )
+
+    text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    return text
+
+
+def causal_combine_logits(
+    logits_f: torch.Tensor,
+    logits_cf: torch.Tensor,
+    gamma: float = 1.0,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    eps: float = 1e-5,
+):
+    """
+    CAUSALMM 风格的后置解码：
+      logits_f: factual logits        [1, V]
+      logits_cf: counterfactual logits[1, V]
+
+    返回：因果修正后的概率分布 probs [1, V]
+    """
+    import math
+    # 转 float32 稳定一点
+    logits_f = logits_f.float()
+    logits_cf = logits_cf.float()
+    # 论文里的核心：用 Δ = logits_f - logits_cf 做因果校正
+    delta = logits_f - logits_cf
+    logits_adj = logits_f + gamma * delta - math.log(eps)
+
+    # 为了数值稳定，减去 max
+    logits_adj = logits_adj - logits_adj.max(dim=-1, keepdim=True).values
+
+    # temperature
+    if temperature > 0:
+        logits_adj = logits_adj / temperature
+
+    # top-p (nucleus) 截断，避免尾部奇怪 token
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits_adj, descending=True, dim=-1)
+        probs = F.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(probs, dim=-1)
+
+        # cutoff mask
+        cutoff_mask = cumulative_probs > top_p
+        # 保留第一个超过 top_p 的
+        cutoff_mask[..., 1:] = cutoff_mask[..., :-1].clone()
+        cutoff_mask[..., 0] = False
+
+        # 把被截掉的 logits 设成 -inf
+        sorted_logits = sorted_logits.masked_fill(cutoff_mask, float("-inf"))
+        # scatter 回原位置
+        logits_adj = torch.full_like(logits_adj, float("-inf"))
+        logits_adj.scatter_(-1, sorted_indices, sorted_logits)
+
+    probs = F.softmax(logits_adj, dim=-1)
+    return probs
+
+
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def generate_with_prefix_rpg(
+    model,
+    prefix_vec_f: torch.Tensor,
+    prefix_vec_cf_v: torch.Tensor,
+    prefix_vec_cf_l: torch.Tensor,
+    adapter_name: str = "residual",
+    max_new_tokens: int = 256,
+    gamma: float = 0.5,
+    epsilon: float = 0.1,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+):
+    """
+    最终 RPG 推理（对齐论文 CAUSALMM 的 contrastive decoding）：
+      logits_f      : factual（真实图像 + 模板先验）
+      logits_cf_v   : visual counterfactual（去/扰动视觉）
+      logits_cf_l   : language counterfactual（去模板语言先验）
+    diffs = (1 + 2γ) * f  - γ * cf_v - γ * cf_l
+    cutoff = log(ε) + max(f)
+    cf_logits = diffs(mask f < cutoff -> -inf)
+    然后对 cf_logits 做 temperature / top_p nucleus sampling。
+    """
+    from transformers.generation.logits_process import (
+        LogitsProcessorList,
+        TopPLogitsWarper,
+        TemperatureLogitsWarper,
+    )
+
+    lm = model.lm
+    tokenizer = model.tokenizer
+    device = prefix_vec_f.device
+    input_emb_layer = lm.get_input_embeddings()
+
+    lm.set_adapter(adapter_name)
+
+    # ---------- 1) prefix embeds ----------
+    prefix_embeds_f, prefix_mask_f = model._build_prefix(prefix_vec_f)      # [1,P,H], [1,P]
+    prefix_embeds_cf_v, prefix_mask_cf_v = model._build_prefix(prefix_vec_cf_v)
+    prefix_embeds_cf_l, prefix_mask_cf_l = model._build_prefix(prefix_vec_cf_l)
+
+    # ---------- 2) prompt ----------
+    if adapter_name == "template":
+        prompt_text = (
+            "Write a concise, structured radiology IMPRESSION for a chest X-ray. "
+            "Do not list findings. Summarize clinical significance only.\n"
+            "Impression: "
+        )
+    else:
+        prompt_text = (
+            "Write detailed radiology FINDINGS for a chest X-ray. "
+            "Focus on abnormalities. Do not write the impression.\n"
+            "Findings: "
+        )
+
+    prompt_ids = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).input_ids.to(device)
+
+    prompt_embeds = input_emb_layer(prompt_ids)          # [1, L, H]
+    prompt_mask = torch.ones((1, prompt_ids.size(1)), dtype=torch.long, device=device)
+
+    bos_id = tokenizer.bos_token_id
+    if bos_id is None:
+        bos_id = tokenizer.eos_token_id  # 给 mistral/llava 做兜底
+    bos_ids = torch.tensor([[bos_id]], device=device)
+    bos_embeds = input_emb_layer(bos_ids)                # [1,1,H]
+    bos_mask = torch.ones((1, 1), dtype=torch.long, device=device)
+
+    # Prefix + BOS + Prompt
+    inputs_embeds_f = torch.cat([prefix_embeds_f, bos_embeds, prompt_embeds], dim=1)
+    attn_f = torch.cat([prefix_mask_f, bos_mask, prompt_mask], dim=1)
+
+    inputs_embeds_cf_v = torch.cat([prefix_embeds_cf_v, bos_embeds, prompt_embeds], dim=1)
+    attn_cf_v = torch.cat([prefix_mask_cf_v, bos_mask, prompt_mask], dim=1)
+
+    inputs_embeds_cf_l = torch.cat([prefix_embeds_cf_l, bos_embeds, prompt_embeds], dim=1)
+    attn_cf_l = torch.cat([prefix_mask_cf_l, bos_mask, prompt_mask], dim=1)
+
+    # 给 warper 一个“当前已生成 token ids”的占位（TopP/Temp 不依赖具体 ids 内容）
+    input_ids_shared = torch.cat([bos_ids, prompt_ids], dim=1)  # [1, 1+L]
+
+    # ---------- 3) 初始化 forward（建立各自 kv cache） ----------
+    out_f = lm(inputs_embeds=inputs_embeds_f, attention_mask=attn_f, use_cache=True, return_dict=True)
+    pkv_f = out_f.past_key_values
+    logits_f = out_f.logits[:, -1, :]  # [1, V]
+
+    out_cf_v = lm(inputs_embeds=inputs_embeds_cf_v, attention_mask=attn_cf_v, use_cache=True, return_dict=True)
+    pkv_cf_v = out_cf_v.past_key_values
+    logits_cf_v = out_cf_v.logits[:, -1, :]
+
+    out_cf_l = lm(inputs_embeds=inputs_embeds_cf_l, attention_mask=attn_cf_l, use_cache=True, return_dict=True)
+    pkv_cf_l = out_cf_l.past_key_values
+    logits_cf_l = out_cf_l.logits[:, -1, :]
+
+    # ---------- 4) logits warpers（temperature / top_p） ----------
+    warpers = LogitsProcessorList()
+    if temperature is not None and temperature != 1.0:
+        warpers.append(TemperatureLogitsWarper(temperature))
+    if top_p is not None and top_p < 1.0:
+        warpers.append(TopPLogitsWarper(top_p))
+
+    generated = []
+
+    # ---------- 5) 自回归生成 ----------
+    for _ in range(max_new_tokens):
+        # float32 稳定
+        lf = logits_f.float()
+        lcv = logits_cf_v.float()
+        lcl = logits_cf_l.float()
+
+        # cutoff = log(eps) + max(f)
+        cutoff = torch.log(torch.tensor(epsilon, device=device)) + lf.max(dim=-1, keepdim=True).values
+
+        diffs = (1.0 + 2.0 * gamma) * lf - gamma * lcv - gamma * lcl
+        cf_logits = diffs.masked_fill(lf < cutoff, float("-inf"))
+
+        # 应用 warpers（等价论文 logits_warper）
+        if len(warpers) > 0:
+            cf_logits = warpers(input_ids_shared, cf_logits)
+
+        probs = F.softmax(cf_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)     # [1,1]
+        tok = next_token.item()
+
+        if tok == tokenizer.eos_token_id:
+            break
+        generated.append(tok)
+
+        # 更新 input_ids_shared
+        input_ids_shared = torch.cat([input_ids_shared, next_token], dim=1)
+
+        # 三路都 append 同样 token（共享语言上下文）
+        tok_embeds = input_emb_layer(next_token)  # [1,1,H]
+        one_mask = torch.ones((1, 1), dtype=torch.long, device=device)
+
+        attn_f = torch.cat([attn_f, one_mask], dim=1)
+        attn_cf_v = torch.cat([attn_cf_v, one_mask], dim=1)
+        attn_cf_l = torch.cat([attn_cf_l, one_mask], dim=1)
+
+        out_f = lm(
+            inputs_embeds=tok_embeds,
+            attention_mask=attn_f,
+            past_key_values=pkv_f,
+            use_cache=True,
+            return_dict=True,
+        )
+        pkv_f = out_f.past_key_values
+        logits_f = out_f.logits[:, -1, :]
+
+        out_cf_v = lm(
+            inputs_embeds=tok_embeds,
+            attention_mask=attn_cf_v,
+            past_key_values=pkv_cf_v,
+            use_cache=True,
+            return_dict=True,
+        )
+        pkv_cf_v = out_cf_v.past_key_values
+        logits_cf_v = out_cf_v.logits[:, -1, :]
+
+        out_cf_l = lm(
+            inputs_embeds=tok_embeds,
+            attention_mask=attn_cf_l,
+            past_key_values=pkv_cf_l,
+            use_cache=True,
+            return_dict=True,
+        )
+        pkv_cf_l = out_cf_l.past_key_values
+        logits_cf_l = out_cf_l.logits[:, -1, :]
+
+    text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    return text
