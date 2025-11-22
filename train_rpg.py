@@ -1,4 +1,5 @@
-# train_rpg.py
+
+# train_rpg_corrected.py
 import argparse
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -9,30 +10,41 @@ from torch.utils.data import DataLoader
 from torch.nn import functional as F
 from tqdm import tqdm
 
-from model_rpg import RPGModel
+from model_rpg import RPGModel   # <-- use corrected model file
 from rpg_dataset import RPGDataset, rpg_collate_fn
 
 
 # ---------------------------
 # helpers
 # ---------------------------
-def freeze_all_but_adapter(model: RPGModel, adapter_name: str, train_template_proj=True, train_cross_aligner=True):
+def freeze_all_but_adapter(
+    model: RPGModel,
+    adapter_name: str,
+    train_template_proj: bool = True,
+    train_cross_aligner: bool = True,
+):
     """
-    你当前的 model_rpg.py 没有 freeze_all_but。
-    这里提供等价版本：
-      - 冻结全部参数
-      - 仅解冻指定 adapter 的 LoRA 参数
-      - 可选解冻 template_proj / cross_aligner
+    冻结全部参数，仅训练指定 adapter 的 LoRA 参数 +（可选）aux模块。
+    兼容 PEFT 不同版本的参数命名：
+      - 优先匹配包含 adapter_name 的 LoRA 参数
+      - 若未匹配到任何 LoRA 参数，则退化为解冻所有 LoRA 参数
     """
     # freeze all
     for p in model.parameters():
         p.requires_grad = False
 
-    # unfreeze LoRA params belonging to the adapter
+    # unfreeze LoRA params for this adapter (best effort)
+    matched = 0
     for n, p in model.lm.named_parameters():
-        # peft 的 LoRA 参数名里通常包含 "lora"
         if "lora" in n and adapter_name in n:
             p.requires_grad = True
+            matched += 1
+
+    # fallback: some peft versions don't include adapter name in param names
+    if matched == 0:
+        for n, p in model.lm.named_parameters():
+            if "lora" in n:
+                p.requires_grad = True
 
     # aux modules
     if train_template_proj:
@@ -48,7 +60,6 @@ def export_one_adapter(src_root: str, adapter_name: str, dst_dir: str):
     """
     PEFT 多 adapter 保存后常见结构：
       src_root/<adapter_name>/adapter_config.json
-
     本函数会自动找到真正的 adapter 文件夹，然后只拷贝这一份到 dst_dir。
     """
     cand1 = src_root
@@ -171,7 +182,6 @@ def train_residual_epoch(
         loss_causal_v = 0.5 * loss_causal_hidden_v + 0.5 * loss_causal_prefix_v
 
         # ---------- language cf (remove template prior) ----------
-        # 通过 h_t_zero + drop_ratio=0 复用 implicit_cf forward
         if lambda_lang_causal > 0:
             h_t_zero = torch.zeros_like(h_t)
             outputs_cf_l, r_p_cf_l = model.forward_residual_implicit_cf(
@@ -193,7 +203,6 @@ def train_residual_epoch(
         else:
             loss_causal_l = torch.tensor(0.0, device=device)
 
-        # total
         loss = loss_f + lambda_causal * loss_causal_v + lambda_lang_causal * loss_causal_l
 
         optimizer.zero_grad()
@@ -301,9 +310,6 @@ def eval_residual_epoch(
 # ---------------------------
 def main(args):
     train_jsonl = args.train_jsonl
-    lm_name = args.lm_name
-    clip_name = args.clip_name
-    template_enc_name = args.template_enc_name
 
     batch_size = args.batch_size
     num_workers = args.num_workers
@@ -311,15 +317,16 @@ def main(args):
 
     template_epochs = args.t_epochs
     residual_epochs = args.r_epochs
+
     lambda_causal = args.lambda_causal
     lambda_lang_causal = args.lambda_lang_causal
+
     cf_mode = args.cf_mode
     drop_ratio = args.dropout
 
     lr = args.lr
     device = args.device if torch.cuda.is_available() else "cpu"
 
-    # logs
     loss_log = {
         "template_train": [],
         "template_val": [],
@@ -332,20 +339,21 @@ def main(args):
 
     # model
     model = RPGModel(
-        lm_name=lm_name,
-        clip_model_name=clip_name,
-        template_model_name=template_enc_name,
+        lm_name=args.lm_name,
+        clip_model_name=args.clip_name,
+        template_model_name=args.template_enc_name,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        num_prefix_tokens=args.num_prefix_tokens,
         lora_ckpt=None,
         aux_ckpt=None,
     )
     model.to(device)
 
     # datasets / loaders
-    train_dataset = RPGDataset(jsonl_path=train_jsonl, split="train")
-    val_dataset   = RPGDataset(jsonl_path=train_jsonl, split="val")
+    train_dataset = RPGDataset(jsonl_path=train_jsonl, split="train", image_root=args.image_root)
+    val_dataset   = RPGDataset(jsonl_path=train_jsonl, split="val", image_root=args.image_root)
 
     train_loader = DataLoader(
         train_dataset,
@@ -354,6 +362,7 @@ def main(args):
         num_workers=num_workers,
         collate_fn=rpg_collate_fn,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -362,6 +371,7 @@ def main(args):
         num_workers=num_workers,
         collate_fn=rpg_collate_fn,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
 
     os.makedirs("./checkpoints", exist_ok=True)
@@ -369,7 +379,8 @@ def main(args):
     # ========= Stage 1 =========
     print("\n===== Stage 1: Train Template Path (LoRA_t) =====")
     model.lm.set_adapter("template")
-    freeze_all_but_adapter(model, "template", train_template_proj=True, train_cross_aligner=True)
+    # Stage1 不需要训练 cross_aligner（template 路径不走它）
+    freeze_all_but_adapter(model, "template", train_template_proj=True, train_cross_aligner=False)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
 
     best_t_val = float("inf")
@@ -397,13 +408,11 @@ def main(args):
 
         if val_loss < best_t_val:
             best_t_val = val_loss
-
             model.lm.save_pretrained(
                 best_t_dir,
                 save_adapter=True,
                 adapter_name="template",
             )
-
             torch.save(
                 {
                     "cross_aligner": model.cross_aligner.state_dict(),
@@ -453,13 +462,11 @@ def main(args):
 
         if val_loss < best_p_val:
             best_p_val = val_loss
-
             model.lm.save_pretrained(
                 best_p_dir,
                 save_adapter=True,
                 adapter_name="residual",
             )
-
             torch.save(
                 {
                     "cross_aligner": model.cross_aligner.state_dict(),
@@ -486,7 +493,6 @@ def main(args):
     )
 
     shutil.copy2(best_p_aux, "./rpg_llava_lora/rpg_aux.pt")
-
     print("BEST template adapter -> ./rpg_llava_lora/template")
     print("BEST residual adapter -> ./rpg_llava_lora/residual")
     print("BEST aux -> ./rpg_llava_lora/rpg_aux.pt")
@@ -497,12 +503,13 @@ if __name__ == "__main__":
 
     # data / train
     parser.add_argument("--train_jsonl", type=str, default="./rpg_outputs/iu_xray/decomposed_reports.jsonl")
+    parser.add_argument("--image_root", type=str, default="../datasets/iu_xray/images")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--t_epochs", type=int, default=20)
-    parser.add_argument("--r_epochs", type=int, default=20)
+    parser.add_argument("--t_epochs", type=int, default=25)
+    parser.add_argument("--r_epochs", type=int, default=25)
     parser.add_argument("--device", type=str, default="cuda:1")
 
     # model ids
@@ -514,6 +521,9 @@ if __name__ == "__main__":
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+
+    # prefix config
+    parser.add_argument("--num_prefix_tokens", type=int, default=32)
 
     # causal / RPG losses
     parser.add_argument("--lambda_causal", type=float, default=0.1, help="visual implicit CF causal weight")
